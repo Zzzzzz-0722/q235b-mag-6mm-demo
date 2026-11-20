@@ -20,9 +20,7 @@ class Conditions:
     joint: str = "I形对接"
     position: str = "PA"
     gas: str = "100% CO₂"
-    wire_diameter_mm: float = 1.1
     root_gap_mm: float = 1.0
-    groove_angle_deg: float = 0.0
 
 
 @lru_cache(maxsize=2)
@@ -56,6 +54,10 @@ def _result(row: dict[str, Any], label: str, status: str, caveat: str) -> dict[s
         "source_id": row["记录ID"],
         "source": row["来源"],
         "source_url": row["来源链接"],
+        "source_material": row["母材原文范围"],
+        "source_joint": row["接头"],
+        "wire_diameter_mm": row["焊丝直径_mm"],
+        "groove_angle_deg": row["坡口角度_deg"],
         "current_a": row["参考电流_A"],
         "current_min_a": row["电流下限_A"],
         "current_max_a": row["电流上限_A"],
@@ -76,52 +78,40 @@ def _result(row: dict[str, Any], label: str, status: str, caveat: str) -> dict[s
 
 
 def recommend(c: Conditions, path: str = str(DATABASE)) -> dict[str, Any]:
-    """Return a source-linked trial reference, or decline an unsupported combination."""
+    """Retrieve all compatible reference schemes without using wire size as input."""
     rows = load_records(path)
     by_id = {row["记录ID"]: row for row in rows}
     if c.material != "Q235B" or c.position != "PA" or not _same(c.thickness_mm, 6.0):
-        return {"status": "out_of_scope", "message": "初版只覆盖Q235B、6 mm、PA平焊。", "reference": None}
+        return {"status": "out_of_scope", "message": "初版只覆盖Q235B、6 mm、PA平焊。", "matches": []}
 
     lincoln = by_id["LINCOLN-GMAW-6MM-CO2"]
     otc = by_id["OTC-CO2-6MM-I-2PASS"]
     paper = by_id["JAES-SS400-6MM-500"]
-    if (
-        c.joint == "I形对接" and c.gas == "100% CO₂"
-        and _same(c.wire_diameter_mm, 1.1)
-        and _same(c.groove_angle_deg, 0)
-        and _inside(c.root_gap_mm, 0, 1.6)
-    ):
-        return _result(
-            lincoln, "厂家试焊参考", "reference_match",
-            "原文为碳钢短路过渡指南，电流是近似值；Q235B焊透和质量尚未试验确认。"
-        )
-
-    if (
-        c.joint == "I形对接" and c.gas == "100% CO₂"
-        and _same(c.wire_diameter_mm, 1.2)
-        and _same(c.groove_angle_deg, 0)
-        and _inside(c.root_gap_mm, 1.2, 1.5)
-    ):
-        return _result(
-            otc, "厂家双面焊参考", "reference_match",
-            "原表为正面和反面各焊一道，共2层；该行未明确标示PA位置，且不是Q235B实测，不能作为单面单道推荐。"
-        )
-
-    if (
-        c.joint == "单V形对接" and c.gas == "82% Ar + 18% CO₂"
-        and _same(c.wire_diameter_mm, 1.2)
-        and _same(c.groove_angle_deg, 60)
-        and _same(c.root_gap_mm, 2)
-    ):
-        return _result(
-            paper, "相近材料论文参考", "analog_match",
-            "论文母材为SS400，非Q235B；500 mm/min是该论文在其工况下的综合选择，不能直接当作本组已验证参数。"
-        )
+    matches = []
+    if c.joint == "I形对接" and c.gas == "100% CO₂":
+        if _inside(c.root_gap_mm, 0, 1.6):
+            matches.append(_result(
+                lincoln, "厂家试焊参考", "reference_match",
+                "原文为碳钢短路过渡指南，电流是近似值；道次未明确；Q235B焊透和质量尚未试验确认。"
+            ))
+        if _inside(c.root_gap_mm, 1.2, 1.5):
+            matches.append(_result(
+                otc, "厂家双面焊参考", "reference_match",
+                "原表为正面和反面各焊一道，共2层；该行未明确标示PA位置，且不是Q235B实测，不能作为单面单道推荐。"
+            ))
+    if c.joint == "单V形对接" and c.gas == "82% Ar + 18% CO₂" and _same(c.root_gap_mm, 2):
+        matches.append(_result(
+            paper, "相近材料论文典型案例", "analog_match",
+            "原文为SS400、60°坡口、单面单道；500 mm/min仅是论文对照组之一，不是Q235B已验证参数。"
+        ))
+    if matches:
+        return {"status": "reference_matches", "matches": matches}
 
     nearest = lincoln if c.gas == "100% CO₂" else paper
     return {
         "status": "no_exact_reference",
-        "message": "资料库中没有同时匹配板厚、接头、保护气、焊丝和组对尺寸的参数。",
+        "message": "资料库中没有同时匹配板厚、接头、保护气和根部间隙的参考工况。",
+        "matches": [],
         "reference": {
             "source_id": nearest["记录ID"],
             "source": nearest["来源"],
@@ -138,14 +128,9 @@ def standard_context(c: Conditions, path: str = str(DATABASE)) -> dict[str, Any]
     """Expose GB 50661 conditional ranges without treating them as a universal check."""
     rows = load_records(path)
     national = [row for row in rows if row["数据类别"] == "国标条件范围"]
-    applicable = (
-        c.material == "Q235B" and c.position == "PA" and _same(c.wire_diameter_mm, 1.2)
-        and not c.gas == "100% CO₂"
-    )
     return {
         "directly_comparable": False,
-        "note": "GB 50661第6.6节是满足特定条件时的免评定范围；本组尚未核实全部条件，不能据此判断合格。"
-        if applicable else "当前输入与表6.6.2-4的焊丝或工艺条件不符，不能直接比较。",
+        "note": "GB 50661第6.6节是特定条件下的免评定范围；本组尚未核实全部条件，不能将其当作本工况合格判定或单道配方。",
         "ranges": [
             {
                 "role": row["道次/角色"], "current_min_a": row["电流下限_A"],
